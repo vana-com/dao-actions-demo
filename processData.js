@@ -3,16 +3,25 @@
 const fs = require('fs');
 const path = require('path');
 
-// Read the input string from a file
-const inputPath = path.join(__dirname, 'encoded.txt');
-const encodedData = fs.readFileSync(inputPath, 'utf8').trim();
+try {
+    // Read the data from a file
+    const inputPath = path.join(__dirname, 'data.json');
+    const data = JSON.parse(fs.readFileSync(inputPath, 'utf8').trim());
 
-const decodedData = Buffer.from(encodedData, 'base64').toString('ascii');
+    console.log(`Found ${data?.users?.length} user records.`)
 
-console.log(`Encoded: ${encodedData}`);
-console.log(`Decoded: ${decodedData}`);
+    const analytics = {
+        totalRecords: data.users.length
+    }
 
-// Optional: Write the results to a file
-const outputPath = path.join(__dirname, 'decoded.txt');
-const outputContent = `Encoded: ${encodedData}\nDecoded: ${decodedData}`;
-fs.writeFileSync(outputPath, outputContent);
+    // Write analytics.txt
+    const outputPath = path.join(__dirname, 'analytics.json');
+    const outputContent = JSON.stringify(analytics, null, 2);
+
+    fs.writeFileSync(outputPath, outputContent);
+
+    console.log(`Saved analytics.txt`)
+} catch (e) {
+    console.error('Failed to read data.json', e)
+    process.exit(1)
+}
