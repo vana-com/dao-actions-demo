@@ -20,7 +20,7 @@ try {
 
     fs.writeFileSync(outputPath, outputContent);
 
-    console.log(`Saved analytics.txt`)
+    console.log(`Saved analytics.json`)
 } catch (e) {
     console.error('Failed to read data.json', e)
     process.exit(1)
