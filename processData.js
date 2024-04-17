@@ -7,10 +7,9 @@ const os = require('os');
 
 const dataDir = path.join(__dirname, 'data');
 const progressFile = 'progress.json';
-const SAMPLE_SIZE = 1000;  // Reservoir sample size for vote data
+const RESERVOIR_SAMPLE_SIZE = 1000;
 
-let upvotesSample = [];
-let downvotesSample = [];
+const activitySamples = [];
 
 const loadProgress = () => {
     if (fs.existsSync(progressFile)) {
@@ -79,19 +78,29 @@ const updateDateRange = (metrics, dateString) => {
 
 const reservoirSample = (sampleArray, newValue) => {
     const currentSize = sampleArray.length;
-    if (currentSize < SAMPLE_SIZE) {
+    if (currentSize < RESERVOIR_SAMPLE_SIZE) {
         sampleArray.push(newValue);
     } else {
         const replaceIndex = Math.floor(Math.random() * (currentSize + 1));
-        if (replaceIndex < SAMPLE_SIZE) {
+        if (replaceIndex < RESERVOIR_SAMPLE_SIZE) {
             sampleArray[replaceIndex] = newValue;
         }
+    }
+};
+
+const sampleUserEngagement = (totalActivities, activeDays) => {
+    if (activeDays.size > 0) {
+        const averageActivities = totalActivities / activeDays.size;
+        reservoirSample(activitySamples, averageActivities); // Sample this user's average activities per active day
     }
 };
 
 const processFile = (file, metrics) => {
     const csvData = fs.readFileSync(file, 'utf8');
     const { headers, data } = extractDataFromCSV(csvData);
+
+    let totalActivities = 0;
+    let activeDays = new Set();
 
     data.forEach(row => {
         const dateIndex = headers.indexOf('date');
@@ -100,7 +109,10 @@ const processFile = (file, metrics) => {
         const date = row[dateIndex];
         const bodyLength = bodyIndex !== -1 && row[bodyIndex] ? row[bodyIndex].trim().length : 0;
 
-        if (date) updateDateRange(metrics, date);
+        if (date) {
+            activeDays.add(date);
+            updateDateRange(metrics, date);
+        }
 
         if (path.basename(file) === 'posts.csv' || path.basename(file) === 'comments.csv') {
             if (path.basename(file) === 'posts.csv') {
@@ -110,23 +122,21 @@ const processFile = (file, metrics) => {
                 metrics.totalComments++;
                 welfordUpdate(metrics.commentLengthStats, bodyLength);
             }
-        } else if (file.includes('post_votes.csv') || file.includes('comment_votes.csv')) {
-            const voteDirection = row[directionIndex];
-            const voteCount = voteDirection === 'up' ? 1 : (voteDirection === 'down' ? -1 : 0);
-            if (voteDirection === 'up') {
-                reservoirSample(upvotesSample, voteCount);
-            } else if (voteDirection === 'down') {
-                reservoirSample(downvotesSample, voteCount);
-            }
+        }
+
+        if (path.basename(file) === 'posts.csv' || path.basename(file) === 'comments.csv' || file.includes('post_votes.csv') || file.includes('comment_votes.csv')) {
+            totalActivities++;
+        }
+
+        if (file.includes('posts.csv') || file.includes('comments.csv') || file.includes('votes.csv')) {
+            sampleUserEngagement(totalActivities, activeDays);
         }
     });
 };
 
 const generateAnalytics = (metrics) => {
-    upvotesSample.sort((a, b) => a - b);
-    downvotesSample.sort((a, b) => a - b);
-    const medianUpvotes = upvotesSample[Math.floor(upvotesSample.length / 2)];
-    const medianDownvotes = downvotesSample[Math.floor(downvotesSample.length / 2)];
+    activitySamples.sort((a, b) => a - b);
+    const medianActivityPerDay = activitySamples[Math.floor(activitySamples.length / 2)];
 
     return {
         totalPosts: metrics.totalPosts,
@@ -137,8 +147,7 @@ const generateAnalytics = (metrics) => {
         commentLengthStdDev: Math.sqrt(metrics.commentLengthStats.M2 / metrics.commentLengthStats.count),
         startDate: new Date(metrics.startDate).toISOString(),
         endDate: new Date(metrics.endDate).toISOString(),
-        medianUpvotesPerPostOrComment: medianUpvotes,
-        medianDownvotesPerPostOrComment: medianDownvotes
+        medianActivityPerActiveDay: medianActivityPerDay
     };
 };
 
