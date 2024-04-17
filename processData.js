@@ -6,6 +6,23 @@ const { execSync } = require('child_process');
 const os = require('os');
 
 const dataDir = path.join(__dirname, 'data');
+const progressFile = 'progress.json';
+const SAMPLE_SIZE = 1000;  // Reservoir sample size for vote data
+
+let upvotesSample = [];
+let downvotesSample = [];
+
+const loadProgress = () => {
+    if (fs.existsSync(progressFile)) {
+        const progressData = fs.readFileSync(progressFile, 'utf8');
+        return JSON.parse(progressData);
+    }
+    return { processedFiles: [], metrics: initializeMetrics() };
+};
+
+const saveProgress = (progress) => {
+    fs.writeFileSync(progressFile, JSON.stringify(progress, null, 2));
+};
 
 const extractDataFromCSV = csvData => {
     let records = [], fields = [], currentField = '', inQuotes = false, i = 0;
@@ -37,153 +54,122 @@ const extractDataFromCSV = csvData => {
     return { headers: records[0], data: records.slice(1) };
 };
 
-const calculateStatistics = (data) => {
-    if (data.length === 0) {
-        return {
-            median: 0,
-            mean: 0,
-            stdDev: 0,
-            coefficientOfVariation: 0
-        };
-    }
+const initializeMetrics = () => ({
+    totalPosts: 0,
+    totalComments: 0,
+    postLengthStats: { count: 0, mean: 0, M2: 0 },
+    commentLengthStats: { count: 0, mean: 0, M2: 0 },
+    startDate: Infinity,
+    endDate: -Infinity
+});
 
-    const sortedData = data.sort((a, b) => a - b);
-    const n = data.length;
-    const median = n % 2 === 0 ? (sortedData[n / 2 - 1] + sortedData[n / 2]) / 2 : sortedData[(n - 1) / 2];
-    const mean = data.reduce((a, b) => a + b, 0) / n;
-    const stdDev = Math.sqrt(data.reduce((sum, value) => sum + Math.pow(value - mean, 2), 0) / n);
-    const coefficientOfVariation = mean !== 0 ? stdDev / mean : 0;
+const welfordUpdate = (stats, newValue) => {
+    const delta = newValue - stats.mean;
+    stats.mean += delta / ++stats.count;
+    const delta2 = newValue - stats.mean;
+    stats.M2 += delta * delta2;
+};
+
+const updateDateRange = (metrics, dateString) => {
+    if (!dateString) return;
+    const dateValue = new Date(dateString).getTime();
+    if (dateValue < metrics.startDate) metrics.startDate = dateValue;
+    if (dateValue > metrics.endDate) metrics.endDate = dateValue;
+};
+
+const reservoirSample = (sampleArray, newValue) => {
+    const currentSize = sampleArray.length;
+    if (currentSize < SAMPLE_SIZE) {
+        sampleArray.push(newValue);
+    } else {
+        const replaceIndex = Math.floor(Math.random() * (currentSize + 1));
+        if (replaceIndex < SAMPLE_SIZE) {
+            sampleArray[replaceIndex] = newValue;
+        }
+    }
+};
+
+const processFile = (file, metrics) => {
+    const csvData = fs.readFileSync(file, 'utf8');
+    const { headers, data } = extractDataFromCSV(csvData);
+
+    data.forEach(row => {
+        const dateIndex = headers.indexOf('date');
+        const bodyIndex = headers.indexOf('body');
+        const directionIndex = headers.indexOf('direction');
+        const date = row[dateIndex];
+        const bodyLength = bodyIndex !== -1 && row[bodyIndex] ? row[bodyIndex].trim().length : 0;
+
+        if (date) updateDateRange(metrics, date);
+
+        if (path.basename(file) === 'posts.csv' || path.basename(file) === 'comments.csv') {
+            if (path.basename(file) === 'posts.csv') {
+                metrics.totalPosts++;
+                welfordUpdate(metrics.postLengthStats, bodyLength);
+            } else {
+                metrics.totalComments++;
+                welfordUpdate(metrics.commentLengthStats, bodyLength);
+            }
+        } else if (file.includes('post_votes.csv') || file.includes('comment_votes.csv')) {
+            const voteDirection = row[directionIndex];
+            const voteCount = voteDirection === 'up' ? 1 : (voteDirection === 'down' ? -1 : 0);
+            if (voteDirection === 'up') {
+                reservoirSample(upvotesSample, voteCount);
+            } else if (voteDirection === 'down') {
+                reservoirSample(downvotesSample, voteCount);
+            }
+        }
+    });
+};
+
+const generateAnalytics = (metrics) => {
+    upvotesSample.sort((a, b) => a - b);
+    downvotesSample.sort((a, b) => a - b);
+    const medianUpvotes = upvotesSample[Math.floor(upvotesSample.length / 2)];
+    const medianDownvotes = downvotesSample[Math.floor(downvotesSample.length / 2)];
 
     return {
-        median: parseFloat(median.toFixed(2)),
-        mean: parseFloat(mean.toFixed(2)),
-        stdDev: parseFloat(stdDev.toFixed(2)),
-        coefficientOfVariation: parseFloat(coefficientOfVariation.toFixed(2))
+        totalPosts: metrics.totalPosts,
+        totalComments: metrics.totalComments,
+        postLengthMean: metrics.postLengthStats.mean,
+        postLengthStdDev: Math.sqrt(metrics.postLengthStats.M2 / metrics.postLengthStats.count),
+        commentLengthMean: metrics.commentLengthStats.mean,
+        commentLengthStdDev: Math.sqrt(metrics.commentLengthStats.M2 / metrics.commentLengthStats.count),
+        startDate: new Date(metrics.startDate).toISOString(),
+        endDate: new Date(metrics.endDate).toISOString(),
+        medianUpvotesPerPostOrComment: medianUpvotes,
+        medianDownvotesPerPostOrComment: medianDownvotes
     };
 };
 
-const processZipFile = (zipFile, metrics) => {
-    const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reddit-data-'));
-    execSync(`unzip -q "${zipFile}" -d "${tempDir}"`);
+const processZipFiles = () => {
+    const progress = loadProgress();
+    const zipFiles = fs.readdirSync(dataDir).filter(file => file.endsWith('.zip'));
 
-    const files = fs.readdirSync(tempDir);
-    metrics.totalUsers++;
+    zipFiles.forEach(zipFile => {
+        if (!progress.processedFiles.includes(zipFile)) {
+            const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'reddit-data-'));
+            execSync(`unzip -q "${path.join(dataDir, zipFile)}" -d "${tempDir}"`);
+            const files = fs.readdirSync(tempDir);
 
-    files.forEach(file => {
-        const csvData = fs.readFileSync(path.join(tempDir, file), 'utf8');
-        let { headers, data } = extractDataFromCSV(csvData);
+            files.forEach(file => {
+                const filePath = path.join(tempDir, file);
+                processFile(filePath, progress.metrics);
+            });
 
-        if (file === 'posts.csv') {
-            metrics.totalPosts += data.length;
-            metrics.postsWithNonEmptyText += data.filter(row => row[headers.indexOf('body')].trim() !== '').length;
-            metrics.postDates = [...metrics.postDates, ...data.map(row => new Date(row[headers.indexOf('date')]))];
-            metrics.postLengths = [...metrics.postLengths, ...data.map(row => row[headers.indexOf('body')].trim().length)];
-        } else if (file === 'comments.csv') {
-            metrics.totalComments += data.length;
-            metrics.commentsWithNonEmptyText += data.filter(row => row[headers.indexOf('body')].trim() !== '').length;
-            metrics.commentDates = [...metrics.commentDates, ...data.map(row => new Date(row[headers.indexOf('date')]))];
-            metrics.commentLengths = [...metrics.commentLengths, ...data.map(row => row[headers.indexOf('body')].trim().length)];
-        } else if (file === 'post_votes.csv') {
-            metrics.postVotes += data.length;
-        } else if (file === 'comment_votes.csv') {
-            metrics.commentVotes += data.length;
-        } else if (file === 'subscribed_subreddits.csv') {
-            metrics.subredditCounts.push(data.length);
+            // Clean up the temporary directory after processing
+            fs.rmdirSync(tempDir, { recursive: true });
+            progress.processedFiles.push(zipFile);
+            saveProgress(progress);
         }
     });
 
-    fs.rmdirSync(tempDir, { recursive: true });
-};
-
-const analyzeTemporalData = (dates) => {
-    const activityByDay = {};
-    const activityByMonth = {};
-    const activityByYear = {};
-
-    dates.forEach(date => {
-        const day = date.toISOString().split('T')[0];
-        const month = date.toISOString().slice(0, 7);
-        const year = date.getFullYear();
-        activityByDay[day] = (activityByDay[day] || 0) + 1;
-        activityByMonth[month] = (activityByMonth[month] || 0) + 1;
-        activityByYear[year] = (activityByYear[year] || 0) + 1;
-    });
-
-    const dailyActivity = Object.values(activityByDay);
-    const monthlyActivity = Object.values(activityByMonth);
-
-    return {
-        dailyCoefficientOfVariation: calculateStatistics(dailyActivity).coefficientOfVariation,
-        monthlyCoefficientOfVariation: calculateStatistics(monthlyActivity).coefficientOfVariation,
-        yearlyActivity: activityByYear
-    };
-};
-
-const generateAnalytics = () => {
-    const zipFiles = fs.readdirSync(dataDir).filter(file => file.endsWith('.zip'));
-    const metrics = {
-        totalUsers: 0,
-        totalPosts: 0,
-        totalComments: 0,
-        postsWithNonEmptyText: 0,
-        commentsWithNonEmptyText: 0,
-        subredditCounts: [],
-        postDates: [],
-        commentDates: [],
-        postLengths: [],
-        commentLengths: [],
-        postVotes: 0,
-        commentVotes: 0,
-    };
-
-    zipFiles.forEach(file => processZipFile(path.join(dataDir, file), metrics));
-
-    const postActivity = analyzeTemporalData(metrics.postDates);
-    const commentActivity = analyzeTemporalData(metrics.commentDates);
-
-    const yearlyActivity = {};
-    Object.entries(postActivity.yearlyActivity).forEach(([year, count]) => {
-        yearlyActivity[year] = (yearlyActivity[year] || 0) + count;
-    });
-    Object.entries(commentActivity.yearlyActivity).forEach(([year, count]) => {
-        yearlyActivity[year] = (yearlyActivity[year] || 0) + count;
-    });
-
-    const totalActivity = Object.values(yearlyActivity).reduce((a, b) => a + b, 0);
-    const activityDistribution = {};
-    Object.entries(yearlyActivity).forEach(([year, count]) => {
-        activityDistribution[year] = parseFloat((count / totalActivity).toFixed(4));
-    });
-
-    return {
-        totalUsers: metrics.totalUsers,
-        totalPosts: metrics.totalPosts,
-        totalComments: metrics.totalComments,
-        totalVotes: metrics.postVotes + metrics.commentVotes,
-        startDate: metrics.postDates.length > 0 ? metrics.postDates.sort((a, b) => a - b)[0].toISOString().split('T')[0] : null,
-        endDate: metrics.commentDates.length > 0 ? metrics.commentDates.sort((a, b) => b - a)[0].toISOString().split('T')[0] : null,
-        medianPostsPerUser: calculateStatistics(metrics.postLengths).median,
-        medianCommentsPerUser: calculateStatistics(metrics.commentLengths).median,
-        medianVotesPerUser: calculateStatistics([...metrics.postLengths, ...metrics.commentLengths]).median,
-        uniqueSubreddits: new Set(metrics.subredditCounts).size,
-        medianSubredditsPerUser: calculateStatistics(metrics.subredditCounts).median,
-        subredditCoefficientOfVariation: calculateStatistics(metrics.subredditCounts).coefficientOfVariation,
-        medianVotesPerPost: calculateStatistics(metrics.postLengths).median,
-        medianVotesPerComment: calculateStatistics(metrics.commentLengths).median,
-        dailyPostCoefficientOfVariation: postActivity.dailyCoefficientOfVariation,
-        monthlyPostCoefficientOfVariation: postActivity.monthlyCoefficientOfVariation,
-        dailyCommentCoefficientOfVariation: commentActivity.dailyCoefficientOfVariation,
-        monthlyCommentCoefficientOfVariation: commentActivity.monthlyCoefficientOfVariation,
-        activityDistributionByYear: activityDistribution,
-        postsWithNonEmptyTextPercentage: parseFloat(((metrics.postsWithNonEmptyText / metrics.totalPosts) * 100).toFixed(2)),
-        commentsWithNonEmptyTextPercentage: parseFloat(((metrics.commentsWithNonEmptyText / metrics.totalComments) * 100).toFixed(2)),
-        medianPostLength: calculateStatistics(metrics.postLengths).median,
-        medianCommentLength: calculateStatistics(metrics.commentLengths).median
-    };
+    return progress.metrics;
 };
 
 const main = () => {
-    const analytics = generateAnalytics();
+    const metrics = processZipFiles();
+    const analytics = generateAnalytics(metrics);
     console.log(JSON.stringify(analytics, null, 2));
     fs.writeFileSync('analytics.json', JSON.stringify(analytics, null, 2));
 };
